@@ -5,7 +5,8 @@ from pathlib import Path
 import regex as re
 from typing import Any, Iterable, Iterator
 import heapq
-from collections import defaultdict
+from typing import Tuple, Dict, List
+from collections import defaultdict, Counter
 # GPT-2 标准预分词正则
 PAT = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
@@ -110,9 +111,46 @@ class Tokenizer:
         special_tokens: list[str] | None = None,
     ):
         self.vocab = vocab
-        self.byte_to_id = {v: k for k, v in vocab.items()}
         self.special_tokens = special_tokens or []
-        # 记录 merge 的先后顺序（rank），用于 encode 时的贪婪合并
+        
+        # 修复点1：构建完整的byte_to_id映射，与train_bpe保持一致
+        self.byte_to_id = {}
+        
+        # 1. 首先添加special tokens
+        for i, token in enumerate(self.special_tokens):
+            token_bytes = token.encode("utf-8")
+            if token_bytes in vocab.values():
+                # 如果vocab中已存在，找到其ID
+                for tid, tbytes in vocab.items():
+                    if tbytes == token_bytes:
+                        self.byte_to_id[token_bytes] = tid
+                        break
+            else:
+                # 否则使用训练时的约定ID
+                self.byte_to_id[token_bytes] = i
+        
+        # 2. 确保所有256个字节值都有正确映射
+        start_byte_id = len(self.special_tokens)
+        for i in range(256):
+            byte_val = bytes([i])
+            # 如果vocab中已存在该字节，使用其ID；否则使用标准偏移
+            found = False
+            for tid, tbytes in vocab.items():
+                if tbytes == byte_val:
+                    self.byte_to_id[byte_val] = tid
+                    found = True
+                    break
+            if not found:
+                # 使用训练时的标准偏移
+                self.byte_to_id[byte_val] = start_byte_id + i
+        
+        # 3. 添加BPE合并产生的token
+        for token_id, token_bytes in vocab.items():
+            # 只添加非字节值的token（避免覆盖）
+            if len(token_bytes) > 1 or (len(token_bytes) == 1 and token_bytes[0] >= 256):
+                self.byte_to_id[token_bytes] = token_id
+        
+        # 记录 merge 的先后顺序
         self.merges = {pair: i for i, pair in enumerate(merges)}
 
     def encode(self, text: str) -> list[int]:
@@ -139,39 +177,41 @@ class Tokenizer:
                 # 按照 GPT-2 逻辑对每个预分词单元进行合并
                 for match in PAT.finditer(part):
                     word_bytes = match.group(0).encode("utf-8")
-                    word_ids = [self.byte_to_id[bytes([b])] for b in word_bytes]
-
-                    # 初始化堆
+                    
+                    # 修复点2：安全地获取每个字节的ID
+                    word_ids = []
+                    for b in word_bytes:
+                        byte_val = bytes([b])
+                        # 使用get并设置默认值防止KeyError
+                        word_ids.append(self.byte_to_id.get(byte_val, len(self.special_tokens) + b))
+                    
+                    # 堆合并逻辑...
                     heap = []
                     for i in range(len(word_ids) - 1):
-                        pair = (self.vocab[word_ids[i]], self.vocab[word_ids[i + 1]])
-                        rank = self.merges.get(pair, float('inf'))
-                        heapq.heappush(heap, (rank, i))
-
-                    # 合并过程
-                    while heap:
-                        rank, best_pair_idx = heapq.heappop(heap)
-                        if rank == float('inf'):
-                            break
-
-                        # 检查索引是否有效
-                        if best_pair_idx >= len(word_ids) - 1:
-                            continue
-
-                        id1, id2 = word_ids[best_pair_idx], word_ids[best_pair_idx + 1]
-                        new_id = self.byte_to_id.get(self.vocab[id1] + self.vocab[id2], None)
-                        if new_id is None:
-                            continue
-
-                        # 更新 word_ids
-                        word_ids = word_ids[:best_pair_idx] + [new_id] + word_ids[best_pair_idx + 2:]
-
-                        # 更新堆
-                        new_heap = []
-                        for i in range(len(word_ids) - 1):
+                        if word_ids[i] in self.vocab and word_ids[i + 1] in self.vocab:
                             pair = (self.vocab[word_ids[i]], self.vocab[word_ids[i + 1]])
                             rank = self.merges.get(pair, float('inf'))
-                            heapq.heappush(new_heap, (rank, i))
+                            heapq.heappush(heap, (rank, i))
+
+                    while heap:
+                        rank, best_pair_idx = heapq.heappop(heap)
+                        if rank == float('inf') or best_pair_idx >= len(word_ids) - 1:
+                            break
+
+                        id1, id2 = word_ids[best_pair_idx], word_ids[best_pair_idx + 1]
+                        new_token = self.vocab.get(id1, b"") + self.vocab.get(id2, b"")
+                        new_id = self.byte_to_id.get(new_token, None)
+                        if new_id is None:
+                            break
+
+                        word_ids = word_ids[:best_pair_idx] + [new_id] + word_ids[best_pair_idx + 2:]
+
+                        new_heap = []
+                        for i in range(len(word_ids) - 1):
+                            if word_ids[i] in self.vocab and word_ids[i + 1] in self.vocab:
+                                pair = (self.vocab[word_ids[i]], self.vocab[word_ids[i + 1]])
+                                rank = self.merges.get(pair, float('inf'))
+                                heapq.heappush(new_heap, (rank, i))
                         heap = new_heap
 
                     token_ids.extend(word_ids)

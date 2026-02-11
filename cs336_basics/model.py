@@ -126,7 +126,26 @@ class SwiGLU(nn.Module):
         up = self.w3(x)         # d_ff
         activated = silu(gate) * up
         return self.w2(activated) # d_model
+class SiLUFFN(nn.Module):
+    """
+    标准 FFN (Linear -> SiLU -> Linear)
+    参数量与 SwiGLU 匹配：d_ff_silu ≈ 1.5 * d_ff_swiglu
+    """
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        super().__init__()
+        # SwiGLU 有3个矩阵，标准 FFN 只有2个
+        # 为了保持参数量大致相等，扩大中间维度为 1.5 倍
+        self.d_ff_scaled = int(1.5 * d_ff)
+        
+        self.w1 = Linear(d_model, self.d_ff_scaled, device=device, dtype=dtype)
+        self.w2 = Linear(self.d_ff_scaled, d_model, device=device, dtype=dtype)
+        
+        # 保存参数量信息供验证
+        self.param_count = sum(p.numel() for p in self.parameters())
 
+    def forward(self, x: torch.Tensor):
+        # 标准 FFN: w2(silu(w1(x)))
+        return self.w2(silu(self.w1(x)))
 # --- §3.5: 初始化逻辑 ---
 def init_weights(module, n_layers, d_model):
     # 处理 Linear 层 [cite: 98, 109]
